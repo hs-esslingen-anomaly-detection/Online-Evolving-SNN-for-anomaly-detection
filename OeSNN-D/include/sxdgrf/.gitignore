@@ -1,0 +1,14 @@
+# Project exclude paths
+/cmake-build-debug/
+/build
+/python_module/np_data
+
+__pymodule__
+__pycache__
+
+.idea
+.vscode
+
+*.png
+*.so
+.*pyc

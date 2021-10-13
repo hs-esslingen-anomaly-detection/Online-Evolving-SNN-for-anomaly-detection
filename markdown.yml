@@ -1,0 +1,12 @@
+---
+geometry:
+  - margin=2.2cm
+classoption:
+  - fleqn
+header-includes:
+  - \usepackage{longtable}\setlength{\LTleft}{1.5em}
+  - \usepackage{float}\let\origfigure\figure\let\endorigfigure\endfigure\renewenvironment{figure}[1][2]{\expandafter\origfigure\expandafter[H]}{\endorigfigure}
+  - \setlength{\mathindent}{1.5em}
+  - \usepackage{graphicx}\makeatother\setkeys{Gin}{width=0.8\linewidth,keepaspectratio}
+---
+

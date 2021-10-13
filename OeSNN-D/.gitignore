@@ -1,0 +1,7 @@
+build/
+__pycache__/
+OeSNNPythonWrapper.cpython*
+fig/
+log/
+optuna.db
+result.json

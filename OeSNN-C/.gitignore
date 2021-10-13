@@ -1,0 +1,11 @@
+build/
+/cmake-build-debug/
+__pycache__/
+OeSNNPythonWrapper.cpython*
+fig/
+.ipynb_checkpoints/
+.idea
+.vscode
+*.png
+hparam_optim/
+result.json

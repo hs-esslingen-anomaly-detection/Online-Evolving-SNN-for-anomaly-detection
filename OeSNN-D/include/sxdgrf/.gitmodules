@@ -1,0 +1,8 @@
+[submodule "kmeans/performance_analysis/data"]
+	path = kmeans/performance_analysis/data
+	url = https://github.com/debait01/SALAD3-Data.git
+	branch = master
+[submodule "python_module/data"]
+	path = python_module/data
+	url = https://github.com/debait01/SALAD3-Data.git
+	branch = master

@@ -1,0 +1,411 @@
+#include "OeSNN.h"
+
+using namespace snn;
+
+void OeSNN::Init() {
+    _randomGenerator = default_random_engine();
+    _randomGenerator.seed( _hyperParam.random ? (unsigned)std::chrono::system_clock::now().time_since_epoch().count() : 1);
+}
+
+OeSNN::OeSNN(int dim, int Wsize, int NOsize, int NIsize, double tau, double weightBias, double sim, double C,
+        double errorCorrection, double anomalyThreshold, int scoreWindowSize, bool random=true, bool debug=false):
+        _movingAverage(scoreWindowSize), _grf(NIsize, dim) {
+
+    _hyperParam = {
+        .dimensions = (unsigned) dim,
+        .Wsize = (unsigned) Wsize,
+        .NOsize = (NOsize < 1 ? 1 : (unsigned)NOsize),
+        .NIsize = (NIsize < 1 ? 1 : (unsigned)NIsize),
+        .sim = (sim <= 0.0 ? 1e-9 : ( sim > 1.0 ? 1.0 : sim )),
+        .C = (C <= 0.0 ? 1e-9 : ( C > 1.0 ? 1.0 : C )),
+        .tau = (tau < 1e-9 ? 1e-9 : tau),
+        .weightBias = (weightBias < 0 ? 0 : (weightBias > 0.5 ? 0.5 : weightBias) ),
+        .errorCorrectionFactor = (errorCorrection <= 0.0 ? 1e-9 : ( errorCorrection > 1.0 ? 1.0 : errorCorrection )),
+        .anomalyThreshold = (anomalyThreshold <= 0.0 ? 1e-9 : (anomalyThreshold >= 1.0 ? 1.0 : anomalyThreshold)),
+        .scoreWindowSize = (unsigned int)(scoreWindowSize < 1 ? 1 : scoreWindowSize),
+        .random = random
+    };
+
+    _debug = debug;
+    _aggregate = WelfordAggregate();
+    OeSNN::Init();
+}
+
+OeSNN::OeSNN(OeSNN::OeSNNConfig config) :
+     _movingAverage(config.scoreWindowSize), _grf(config.NIsize, config.dimensions) {
+    _hyperParam = config;
+    _debug = false;
+    _aggregate = WelfordAggregate();
+    OeSNN::Init();
+}
+
+OeSNN::~OeSNN() {
+    for (auto & _outputNeuron : _outputNeurons) delete _outputNeuron;
+    _outputNeurons.clear();
+    _E.clear();
+    _G.clear();
+    _spikeOrder.clear();
+}
+
+double OeSNN::CalculateDistance(const vector<double> &v1, const vector<double> &v2) {
+    double diffSq = 0.0;
+    for (unsigned int j = 0; j < v1.size(); j++) diffSq += pow(v1[j] - v2[j], 2);
+    return sqrt(diffSq);
+}
+
+void OeSNN::InitializeNeuron(OeSNN::OutputNeuron *n_i, unsigned int dim, const vector<double>& x_t) {
+    /* ensure that all weights exists */
+    for (unsigned int i = 0; i < _hyperParam.NIsize; i++) n_i->weights.push_back(_hyperParam.weightBias);
+
+    double PSP_max = 0.0;
+    for (auto & n_x : _spikeOrder) {
+        n_i->weights[n_x.ID] += exp(-1.0*n_x.firingTime/_hyperParam.tau);
+        // from paper: PSP_max += n_i->weights[n_x.ID] * exp(-1.0*n_x.firingTime/_hyperParam.tau);
+        PSP_max += n_i->weights[n_x.ID] * 1.0; // we use this, make more sense ;)
+    }
+    n_i->gamma = PSP_max * _hyperParam.C;
+
+    n_i->outputValues = vector<double>(dim);
+    auto distributions = _grf.get_marginal_distributions();
+    for(unsigned int i = 0; i < n_i->outputValues.size(); i++) {
+        n_i->outputValues[i] = distributions[i](_randomGenerator);
+    }
+
+    /* if (_neuronAge < 10) { */
+    /*     for(unsigned int i = 0; i < n_i->outputValues.size(); i++) { */
+    /*         cout << "age: " << _neuronAge << " dim: " << i << " val:" << n_i->outputValues[i] << endl;; */
+    /*     } */
+    /* } */
+
+    n_i->M = 1.0;
+    n_i->additionTime = _neuronAge++ * 1.0;
+}
+
+void OeSNN::UpdateNeuron(OeSNN::OutputNeuron *n_i, OeSNN::OutputNeuron *n_s) {
+    for (unsigned int j = 0; j < n_s->weights.size(); j++) {
+        n_s->weights[j] = (n_i->weights[j] + n_s->weights[j] * n_s->M ) / (n_s->M + 1.0 );
+    }
+    n_s->gamma = ( n_i->gamma + n_s->gamma * n_s->M ) / ( n_s->M + 1.0 );
+
+    for(unsigned int i = 0; i < n_s->outputValues.size(); i++) {
+        n_s->outputValues[i] = ( n_i->outputValues[i] + n_s->outputValues[i] * n_s->M ) / ( n_s->M + 1.0 );
+    }
+
+    n_s->additionTime = ( n_i->additionTime + n_s->additionTime * n_s->M ) / ( n_s->M + 1.0 );
+    n_s->M += 1.0;
+    delete n_i;
+}
+
+void OeSNN::CalculateSpikeOrder(std::vector<double>& exc_vals) {
+    _spikeOrder.clear();
+    for (unsigned int j = 0; j < exc_vals.size(); j++) {
+        /* NOTE: There seems to be a problem due to the reference (maybe due to compiler optimization or something else) so we first copy the value
+         * into a locale variable to avoid the problem of all 0 values (later we can implement this even better). */
+        double exc = std::isnan(exc_vals[j]) ? 1e-9 : exc_vals[j];
+        _spikeOrder.push_back({ (unsigned) j, (1.0 - exc) });
+    }
+
+    // sort min to max -> min has fired first
+    sort(_spikeOrder.begin(), _spikeOrder.end(), [](auto a, auto b) { return a.firingTime < b.firingTime; } );
+
+    //TODO Sometimes we don't get back reasonable values, here we have to take a closer look.
+    if(_spikeOrder.front().firingTime == _spikeOrder.back().firingTime) {
+        vector<double> tmp;
+
+        auto distributions = _grf.get_marginal_distributions();
+        for(unsigned int i = 0; i < _hyperParam.dimensions; i++) {
+            tmp.push_back(distributions[i](_randomGenerator));
+        }
+        (void)_grf.update(tmp);
+    }
+
+    if(_debug) {
+        vector<double> tmp1;
+        for (auto & o : _spikeOrder) tmp1.push_back( o.firingTime );
+        _spikingTimes.push_back(tmp1);
+
+        vector<double> tmp2(exc_vals);
+        for (unsigned int i = 0; i < tmp2.size(); i++) {
+            if(std::isnan(tmp2[i])) {
+                tmp2[i] = -1;
+            }
+        }
+        _exc.push_back(tmp2);
+    }
+}
+
+//TODO test value correct with respect to M?
+void OeSNN::ValueCorrection(OeSNN::OutputNeuron *n_c, const vector<double>& x_t) {
+    for (unsigned int i = 0; i < x_t.size(); i++) {
+        n_c->outputValues[i] += (x_t[i] - n_c->outputValues[i]) * _hyperParam.errorCorrectionFactor;
+        //n_c->outputValues[i] += (x_t[i] - n_c->outputValues[i]) * _hyperParam.errorCorrectionFactor * 1/n_c->M;
+    }
+}
+
+double OeSNN::ClassifyAnomaly(double error) {
+    auto e = error;
+    UpdateWelford(e);
+    FinalizeWelford();
+    auto standard_deviation = (_aggregate.sample_variance > 0) ? std::sqrt(_aggregate.sample_variance) : 1.0;
+    auto movingAverage = _movingAverage.UpdateAverage(e);
+    auto cdf = 1 - std::erfc(-(movingAverage - _aggregate.mean)/standard_deviation/std::sqrt(2))/2;
+    auto score = 2.0 * std::abs(cdf - 0.5);
+    return pow(score,2);
+}
+
+void OeSNN::UpdateWelford(double x) {
+    _aggregate.count++;
+    auto delta = (x - _aggregate.mean);
+    _aggregate.mean += delta/_aggregate.count;
+    auto delta2 = (x - _aggregate.mean);
+    _aggregate.m2 += delta * delta2;
+}
+
+void OeSNN::FinalizeWelford() {
+    //Avoid zero division and senseless results from division by -1
+    if (_aggregate.count < 2) {
+        _aggregate.variance = 0;
+        _aggregate.sample_variance = 0;
+        return;
+    }
+
+    /* remove the initial inaccuracy. Hopefully this will lead to a more sensitive outlier score */
+    if(_initializationCounter++ == (int)(_hyperParam.Wsize * 1.1)) {
+        _aggregate.count = 0;
+        _aggregate.mean = 0;
+        _aggregate.m2 = 0;
+        _aggregate.sample_variance = 0;
+        _aggregate.variance = 0;
+        return;
+    }
+
+    _aggregate.variance = _aggregate.m2/_aggregate.count;
+    _aggregate.sample_variance = _aggregate.m2/(_aggregate.count - 1.0);
+}
+
+OeSNN::OutputNeuron* OeSNN::FindMostSimilar(OutputNeuron *n_i) {
+    OutputNeuron* simPtr = _outputNeurons[0];
+    for (auto & n_x : _outputNeurons) {
+        if(CalculateDistance(n_i->weights, n_x->weights) < CalculateDistance(n_i->weights, simPtr->weights)) {
+            simPtr = n_x;
+        }
+    }
+    return simPtr;
+}
+
+void OeSNN::ReplaceOldest(OutputNeuron *n_i) {
+    double oldest = _outputNeurons[0]->additionTime;
+    int oldestIdx = 0;
+
+    for (unsigned int k = 1; k < _outputNeurons.size(); k++) {
+        if (oldest > _outputNeurons[k]->additionTime) {
+            oldest = _outputNeurons[k]->additionTime;
+            oldestIdx = k;
+        }
+    }
+
+    delete _outputNeurons[oldestIdx];
+    _outputNeurons[oldestIdx] = n_i;
+}
+
+
+OeSNN::OutputNeuron* OeSNN::FiresFirst() {
+    for (auto & _outputNeuron : _outputNeurons) _outputNeuron->PSP = 0.0;
+
+    OutputNeuron* maxPtr;
+    vector<OutputNeuron*> toFire;
+
+    int order = 0;
+    for (auto & l : _spikeOrder) {
+        for (auto & n_o : _outputNeurons) {
+            n_o->PSP += exp(-1.0*l.firingTime/_hyperParam.tau) * n_o->weights[l.ID];
+            if (n_o->PSP > n_o->gamma) toFire.push_back(n_o);
+        }
+        if (!toFire.empty()) {
+            maxPtr = toFire[0];
+            for (auto & n_o : toFire) {
+                if ((n_o->PSP - n_o->gamma) > (maxPtr->PSP - maxPtr->gamma)) {
+                    maxPtr = n_o;
+                }
+            }
+            return maxPtr;
+        }
+        order++;
+    }
+
+    return nullptr;
+}
+
+double OeSNN::CalculateMaxDistance() {
+    vector<double> v1, v2;
+    for(unsigned int i = 0; i < _hyperParam.NIsize; i++) {
+        v1.push_back(exp(-1.0/_hyperParam.tau) + _hyperParam.weightBias);
+        v2.push_back(1.0 + _hyperParam.weightBias); // exp(_spikingTime = 0) = 1
+    }
+
+    double diffSq = 0.0;
+    for (unsigned int i = 0; i < v1.size(); i++) diffSq += pow(v1[i] - v2[i], 2);
+
+    return sqrt(diffSq);
+}
+
+void OeSNN::UpdateRepository(const vector<double>& x_t) {
+    auto *n_c = new OutputNeuron;
+    InitializeNeuron(n_c, x_t.size(), x_t);
+    if (_G.back() < _hyperParam.anomalyThreshold) ValueCorrection(n_c, x_t); //if no anomaly --> perfom value correction
+
+    OutputNeuron* n_s = (_CNOsize > 0 ? FindMostSimilar(n_c) : nullptr);
+    if (_CNOsize > 0 && CalculateDistance(n_c->weights, n_s->weights)
+        <= _hyperParam.sim*CalculateMaxDistance()) {
+        UpdateNeuron(n_c, n_s);
+        if(_debug) _updateTypeLog.push_back(1);
+    } else if (_CNOsize < _hyperParam.NOsize) {
+        n_c->ID = _neuronIDcounter++;
+        _outputNeurons.push_back(n_c);
+        _CNOsize++;
+        if(_debug) _updateTypeLog.push_back(2);
+    } else {
+        n_c->ID = _neuronIDcounter++;
+        ReplaceOldest(n_c);
+        if(_debug) _updateTypeLog.push_back(3);
+    }
+}
+
+std::vector<double> OeSNN::UpdateOutput(const std::vector<double>& x_t) {
+    vector<double> y_t;
+
+    OutputNeuron *n_f = FiresFirst();
+    if (n_f == nullptr) {
+
+        if(_debug) _firedLog.push_back(0);
+        if (_outputNeurons.size() > 0) _unfiredTrials++;
+
+        /*TODO: In the current implementation, this function is called at least once, exactly when the window has been read completely,
+         * because the _outputRepository is still empty, we should probably implement this better. */
+        auto distributions = _grf.get_marginal_distributions();
+        for(unsigned int i = 0; i < _hyperParam.dimensions; i++) {
+            y_t.push_back(distributions[i].mean());
+        }
+
+        _E.push_back(DBL_MAX);
+        _G.push_back(1.0);
+    } else {
+        if(_debug) {
+            _firedLog.push_back(n_f->ID);
+        }
+
+        y_t = n_f->outputValues;
+        _E.push_back(abs(CalculateDistance(x_t, y_t)));
+
+
+        vector<double> squaredError;
+        for (unsigned int i = 0; i < x_t.size(); i++) {
+            squaredError.push_back(pow((x_t[i] - y_t[i]), 2));
+        }
+
+        _G.push_back(ClassifyAnomaly(*max_element(squaredError.begin(), squaredError.end())));
+    }
+
+    if(_E.size() > _hyperParam.Wsize + 2) _E.erase(_E.begin());
+    if(_G.size() > _hyperParam.Wsize + 2) _G.erase(_G.begin());
+
+    return y_t;
+}
+
+double OeSNN::GetClassification() {
+    return _G.empty() ? 1.0 : _G.back();
+}
+
+std::vector<double> OeSNN::Predict(const std::vector<double>& x_t) {
+
+    if (_initializationCounter < _hyperParam.Wsize) {
+        vector<double> y_t;
+
+        _initVector.push_back(x_t);
+        if (_debug) {
+            _updateTypeLog.push_back(0);
+            _firedLog.push_back(0);
+            _spikingTimes.emplace_back( vector<double>(_hyperParam.NIsize, 0.0) );
+            _exc.emplace_back( vector<double>(_hyperParam.NIsize, 0.0) );
+        }
+
+        auto distributions = _grf.get_marginal_distributions();
+        for(unsigned int i = 0; i < _hyperParam.dimensions; i++) {
+            y_t.push_back(distributions[i](_randomGenerator));
+        }
+
+        _E.push_back(abs(CalculateDistance(x_t, y_t)));
+        _G.push_back(0.0);
+
+        // NOTE: test implementation to improve clusters sturcture
+        if(!_hyperParam.random) srand(1);
+        if(_initializationCounter == _hyperParam.Wsize - 1) {
+            for (unsigned int i = 0; i < _hyperParam.NIsize; i++) {
+                vector<double> clusterInit;
+                for (unsigned int j = 0; j < _hyperParam.dimensions; j++) {
+                    double max = _initVector[0][j];
+                    double min = _initVector[0][j];
+                    for(unsigned int k = 0; k < _initVector.size(); k++) {
+                        if(max < _initVector[k][j]) max = _initVector[k][j];
+                        if(min > _initVector[k][j]) min = _initVector[k][j];
+                    }
+                    clusterInit.push_back( (double)rand()/(double)RAND_MAX * (max-min) + min);
+                }
+                (void)_grf.update(clusterInit);
+            }
+        }
+
+        _initializationCounter++;
+        return y_t;
+    }
+
+    auto exc_vals = _grf.update(x_t);
+    CalculateSpikeOrder(exc_vals);
+    auto y_t = UpdateOutput(x_t);
+    UpdateRepository(x_t);
+
+    return y_t;
+}
+
+vector<vector<double>> OeSNN::PredictAll(const vector<vector<double>> &values) {
+    OeSNN::Flush();
+
+    vector<vector<double>> retValues;
+    for (unsigned int i=0; i < values.size(); i++)
+        retValues.push_back( Predict(values.at(i)) );
+
+    return retValues;
+}
+
+int OeSNN::GetUnfiredTrials() {
+    return _unfiredTrials;
+}
+
+int OeSNN::GetNumberOutputRepoNeurons() {
+    return _outputNeurons.size();
+}
+
+void OeSNN::Flush(void) {
+    /* clear debung variables */
+    _updateTypeLog.clear();
+    _spikingTimes.clear();
+    _exc.clear();
+    _firedLog.clear();
+}
+
+/* functions for debugging and testing */
+vector<int> OeSNN::GetUpdateTypeLog() {
+    return _updateTypeLog;
+}
+
+vector<vector<double>> OeSNN::GetSpikingTimes() {
+    return _spikingTimes;
+}
+
+vector<vector<double>> OeSNN::GetExc() {
+    return _exc;
+}
+
+vector<int> OeSNN::GetFiredLog() {
+    return _firedLog;
+}
